@@ -1,0 +1,38 @@
+{
+  "_doc": "Per-company adapter config for raw Refinitiv Eikon exports. Each entry describes one company's raw layout so the ingestion engine can normalize it without LLM/OCR. Adapter selection priority: by 'ticker' first, then 'isin'. If neither matches, falls back to the 'STANDARDIZED' adapter for any analyst-prepared template.",
+  "STANDARDIZED": {
+    "_doc": "Default adapter for the analyst-validated standardized template (3 sheets: Altman Z + P&L CO + P&L Standalone)",
+    "type": "standardized_template",
+    "sheets": {
+      "Altman Z score.in ": {"category": "Altman Z"},
+      "P&L Co Extract Sheet.in": {"category": "P&L Consolidated"},
+      "P&L std extract sheet.in ": {"category": "P&L Standalone"}
+    },
+    "particulars_col": "Particulars",
+    "units_col": "Units",
+    "year_col_prefix": "FY"
+  },
+  "SUN.NS": {
+    "_doc": "Sun Pharmaceutical industries Ltd — uses the standardized template since analyst transcribes Refinitiv into it",
+    "type": "standardized_template",
+    "ticker": "SUN.NS",
+    "inherits": "STANDARDIZED"
+  },
+  "DRREDDY.NS": {
+    "_doc": "Dr. Reddy's Laboratories — example placeholder for a raw Refinitiv layout. Each sheet maps columns directly.",
+    "type": "refinitiv_raw",
+    "ticker": "DRREDDY.NS",
+    "sheets": {
+      "Income Statement": {
+        "category": "P&L Consolidated",
+        "particulars_col": "Item",
+        "year_cols_regex": "^\\d{4}-\\d{2}$"
+      },
+      "Balance Sheet": {
+        "category": "Balance Sheet",
+        "particulars_col": "Item",
+        "year_cols_regex": "^\\d{4}-\\d{2}$"
+      }
+    }
+  }
+}

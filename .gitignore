@@ -1,0 +1,29 @@
+# Data (persisted on Railway Volume instead)
+backend/metadata.db
+backend/Temp/
+backend/warehouse/
+backend/output/
+backend/legacy_engines/logs/
+backend/legacy_engines/*.bak
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Node / frontend build
+node_modules/
+frontend/dist/
+frontend/vite.config.ts.timestamp-*.mjs
+
+# OS / editor
+.DS_Store
+.vercel/
+
+# Local secrets
+.env
+backend/app/finintel_platform.db
+backend/finintel.db

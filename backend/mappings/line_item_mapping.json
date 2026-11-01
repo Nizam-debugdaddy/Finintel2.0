@@ -1,0 +1,137 @@
+{
+  "Revenue from Operations": {
+    "aliases": ["Revenue from Ops", "Sales", "Net Revenue", "Revenue from operations", "Net Sales", "Revenue", "Revenue From Operations"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Total Income": {
+    "aliases": ["Total Revenue", "Gross Income"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Cost of Materials Consumed": {
+    "aliases": ["Cost of materials consumed", "Material Cost", "Cost of Raw Materials"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Purchases of Stock-in-Trade": {
+    "aliases": ["Purchases of stock-in-trade", "Stock Purchases", "Purchase of stock"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Changes in Inventories": {
+    "aliases": ["Changes in inventories", "Inventory Change", "Change in inventories"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Employee Benefit Expenses": {
+    "aliases": ["Employee benefit expenses", "Employee Benefit Expense", "Employee Cost", "Staff Cost", "Manpower Cost"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Finance Costs": {
+    "aliases": ["Finance costs", "Finance cost", "Interest Cost", "Interest Expense", "Finance Charges"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Depreciation and Amortisation": {
+    "aliases": ["Depreciation & amortisation", "Depreciation", "D&A", "Depreciation and amortisation", "Depreciation & Amortization"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Other Expenses": {
+    "aliases": ["Other Operating Expenses", "Other Expenditure"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Power, Fuel and Electricity": {
+    "aliases": ["Power, Fuel Electricity", "Power & Fuel", "Power and Fuel", "Energy Cost"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Consumables": {
+    "aliases": ["Consumable Stores", "Stores & Consumables"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Transportation Cost": {
+    "aliases": ["Cost transportation", "Transportation", "Freight", "Logistics Cost"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Rest in Other Expenses": {
+    "aliases": ["Other miscellaneous expenses"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Total Cost": {
+    "aliases": ["Total Expenses", "Total Operating Expenses"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "EBITDA": {
+    "aliases": ["Operating EBITDA"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "PAT": {
+    "aliases": ["Profit After Tax", "Net Profit", "Net Income"],
+    "category": "P&L",
+    "default_units": "INR Million"
+  },
+  "Total Assets": {
+    "aliases": ["Net Assets"],
+    "category": "Balance Sheet",
+    "default_units": "INR Million"
+  },
+  "Current Assets": {
+    "aliases": ["Total Current Assets"],
+    "category": "Balance Sheet",
+    "default_units": "INR Million"
+  },
+  "Current Liabilities": {
+    "aliases": ["Total Current Liabilities"],
+    "category": "Balance Sheet",
+    "default_units": "INR Million"
+  },
+  "Net Worth": {
+    "aliases": ["Total Equity", "Shareholders Equity", "Equity"],
+    "category": "Balance Sheet",
+    "default_units": "INR Million"
+  },
+  "Short Term Borrowings": {
+    "aliases": ["Current Borrowings", "Short-term Debt", "Current Financial Liabilities"],
+    "category": "Balance Sheet",
+    "default_units": "INR Million"
+  },
+  "Long Term Debt": {
+    "aliases": ["Long Term Borrowings", "Non-Current Borrowings"],
+    "category": "Balance Sheet",
+    "default_units": "INR Million"
+  },
+  "Debtors (Receivables)": {
+    "aliases": ["Trade Receivables", "Accounts Receivable"],
+    "category": "Balance Sheet",
+    "default_units": "INR Million"
+  },
+  "Creditors (Payables)": {
+    "aliases": ["Trade Payables", "Accounts Payable"],
+    "category": "Balance Sheet",
+    "default_units": "INR Million"
+  },
+  "Inventory": {
+    "aliases": ["Inventories", "Stock"],
+    "category": "Balance Sheet",
+    "default_units": "INR Million"
+  },
+  "Other Equity (Includes Reserves)": {
+    "aliases": ["Other Equity", "Reserves and Surplus", "Reserves"],
+    "category": "Balance Sheet",
+    "default_units": "INR Million"
+  },
+  "Market Capitalization": {
+    "aliases": ["Market Cap", "Market Value"],
+    "category": "Market",
+    "default_units": "INR Million"
+  }
+}
