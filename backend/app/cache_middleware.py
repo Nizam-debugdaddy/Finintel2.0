@@ -11,7 +11,7 @@ import time
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-CACHE_TTL = 3600  # 1 hour
+CACHE_TTL = 4 * 3600  # 4 hours
 _cache: dict[str, tuple[float, bytes, int, str | None]] = {}
 
 
