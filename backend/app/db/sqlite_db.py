@@ -8,6 +8,8 @@ Keeps the same public interface the routers were written against
 async-with cursors, db.commit() as a no-op) so router code needed no changes
 when the backing store moved from SQLite to Postgres.
 """
+from __future__ import annotations
+
 from contextlib import asynccontextmanager
 
 import asyncpg

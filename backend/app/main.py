@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 
+from app.cache_middleware import CacheMiddleware
 from app.config import settings
 from app.db.sqlite_db import init_db
 from app.routers import (
@@ -47,6 +48,11 @@ app = FastAPI(
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json",
 )
+
+# Cache added before CORS so CORS stays outermost and still wraps cache hits
+# (Starlette: last-added middleware runs first on the request / last on the
+# response, so CORS headers must come from the middleware added last).
+app.add_middleware(CacheMiddleware)
 
 # CORS: frontend (Vercel) and backend (Railway) are on different origins,
 # so this is load-bearing in production — configured via ALLOWED_ORIGINS.
