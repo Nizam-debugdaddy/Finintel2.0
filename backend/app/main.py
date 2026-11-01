@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 
+from app.config import settings
 from app.db.sqlite_db import init_db
 from app.routers import (
     company, financial_input, calculate,
@@ -47,11 +48,11 @@ app = FastAPI(
     openapi_url="/api/openapi.json",
 )
 
-# CORS: in production the frontend is served from the same origin so this is
-# only needed for direct API calls from tools / Postman / dev mode.
+# CORS: frontend (Vercel) and backend (Railway) are on different origins,
+# so this is load-bearing in production — configured via ALLOWED_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
