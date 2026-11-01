@@ -27,3 +27,4 @@ frontend/vite.config.ts.timestamp-*.mjs
 .env
 backend/app/finintel_platform.db
 backend/finintel.db
+backend/.env

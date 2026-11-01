@@ -10,6 +10,7 @@ import threading
 import time
 from pathlib import Path
 
+import os
 import duckdb
 import pandas as pd
 
@@ -52,67 +53,38 @@ class QueryEngine:
             self._register_views_locked()
 
     def _register_views_locked(self):
-        if any(self.paths.wh_financials.rglob("*.parquet")):
-            glob = str(self.paths.wh_financials / "**" / "*.parquet")
-            try:
-                self.con.execute(
-                    f"CREATE OR REPLACE VIEW financials AS "
-                    f"SELECT * FROM read_parquet('{glob}', hive_partitioning=true)"
-                )
-                self.con.execute(
-                    f"CREATE OR REPLACE VIEW financials_latest AS "
-                    f"SELECT * FROM financials WHERE is_active = TRUE"
-                )
-            except Exception as e:
-                # ── Corrupted file detected — scan, quarantine, retry ──────────
-                logger.warning(f"Parquet glob failed ({e}). Scanning for bad files…")
-                bad_files = self._quarantine_bad_parquets()
-                if bad_files:
-                    logger.warning(f"Quarantined {len(bad_files)} bad parquet(s): {bad_files}")
-                    # Retry after removing bad files
-                    if any(self.paths.wh_financials.rglob("*.parquet")):
-                        try:
-                            self.con.execute(
-                                f"CREATE OR REPLACE VIEW financials AS "
-                                f"SELECT * FROM read_parquet('{glob}', hive_partitioning=true)"
-                            )
-                            self.con.execute(
-                                f"CREATE OR REPLACE VIEW financials_latest AS "
-                                f"SELECT * FROM financials WHERE is_active = TRUE"
-                            )
-                            logger.info("Financials view registered successfully after repair.")
-                        except Exception as e2:
-                            logger.error(f"View registration failed even after repair: {e2}")
-                else:
-                    logger.error(f"No bad files found; view registration failed: {e}")
+        """Attach the Postgres warehouse (Supabase) and expose the same view
+        names callers always used (financials, financials_latest,
+        company_master, sector_mapping, audit_log), now backed by Postgres
+        tables instead of local parquet files.
 
-        if self.paths.wh_company_master.exists():
-            try:
-                self.con.execute(
-                    f"CREATE OR REPLACE VIEW company_master AS "
-                    f"SELECT * FROM read_parquet('{self.paths.wh_company_master}')"
-                )
-            except Exception as e:
-                logger.warning(f"company_master view failed: {e}")
-        if self.paths.wh_sector_map.exists():
-            try:
-                self.con.execute(
-                    f"CREATE OR REPLACE VIEW sector_mapping AS "
-                    f"SELECT * FROM read_parquet('{self.paths.wh_sector_map}')"
-                )
-            except Exception as e:
-                logger.warning(f"sector_mapping view failed: {e}")
-        if self.paths.wh_audit.exists():
-            try:
-                self.con.execute(
-                    f"CREATE OR REPLACE VIEW audit_log AS "
-                    f"SELECT * FROM read_parquet('{self.paths.wh_audit}')"
-                )
-            except Exception as e:
-                logger.warning(f"audit_log view failed: {e}")
-        self._last_registered = time.monotonic()
-        logger.info("DuckDB views registered: financials, financials_latest, "
-                    "company_master, sector_mapping, audit_log")
+        NOTE: pulling the full 567k-row `financials` table in one shot (either
+        as a live SELECT * or materialized into a local table) is unreliable
+        on Supabase's free tier — the pooler killed the connection mid-fetch
+        in testing. Filtered, single-company/single-year queries (the normal
+        access pattern) push their WHERE clause down to Postgres and return
+        in a few seconds. Only unfiltered/wide fan-out queries (e.g. sector
+        ranking across many companies) are at risk of being slow, since each
+        company's query is a real network round-trip serialized through this
+        connection's lock, where it used to be an instant local disk read."""
+        database_url = os.environ.get("DATABASE_URL", "")
+        try:
+            self.con.execute("INSTALL postgres; LOAD postgres;")
+            self.con.execute(
+                "ATTACH IF NOT EXISTS ? AS pg (TYPE POSTGRES)", [database_url]
+            )
+            self.con.execute("CREATE OR REPLACE VIEW financials AS SELECT * FROM pg.financials")
+            self.con.execute(
+                "CREATE OR REPLACE VIEW financials_latest AS "
+                "SELECT * FROM financials WHERE is_active = TRUE"
+            )
+            self.con.execute("CREATE OR REPLACE VIEW company_master AS SELECT * FROM pg.company_master")
+            self.con.execute("CREATE OR REPLACE VIEW sector_mapping AS SELECT * FROM pg.sector_mapping")
+            self.con.execute("CREATE OR REPLACE VIEW audit_log AS SELECT * FROM pg.wh_audit_log")
+            logger.info("DuckDB views registered over Postgres: financials, financials_latest, "
+                        "company_master, sector_mapping, audit_log")
+        except Exception as e:
+            logger.error(f"Postgres-backed view registration failed: {e}")
 
     def _quarantine_bad_parquets(self) -> list:
         """Scan every parquet file individually. Rename corrupted ones to .bad.

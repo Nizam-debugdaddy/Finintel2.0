@@ -23,7 +23,7 @@ class SectorAssign(BaseModel):
 async def list_companies(db=Depends(get_db)):
     async with db.execute("""
         SELECT c.company_id, c.company_name, c.ticker, c.active_flag,
-               GROUP_CONCAT(s.sector || '|' || COALESCE(s.sub_sector,''), ', ') as sectors_raw
+               STRING_AGG(s.sector || '|' || COALESCE(s.sub_sector,''), ', ') as sectors_raw
         FROM companies c
         LEFT JOIN sectors s ON c.company_id = s.company_id
         WHERE c.active_flag = 1
@@ -71,7 +71,7 @@ async def create_company(data: CompanyCreate, db=Depends(get_db)):
         for s in all_sectors:
             if s.get("sector"):
                 await db.execute(
-                    "INSERT OR IGNORE INTO sectors(company_id,sector,sub_sector) VALUES(?,?,?)",
+                    "INSERT INTO sectors(company_id,sector,sub_sector) VALUES(?,?,?) ON CONFLICT (company_id, sector) DO NOTHING",
                     (cid, s["sector"], s.get("sub_sector", ""))
                 )
         await db.commit()
@@ -82,7 +82,7 @@ async def create_company(data: CompanyCreate, db=Depends(get_db)):
 @router.post("/{company_id}/sector")
 async def assign_sector(company_id: str, data: SectorAssign, db=Depends(get_db)):
     await db.execute(
-        "INSERT OR IGNORE INTO sectors(company_id,sector,sub_sector) VALUES(?,?,?)",
+        "INSERT INTO sectors(company_id,sector,sub_sector) VALUES(?,?,?) ON CONFLICT (company_id, sector) DO NOTHING",
         (company_id, data.sector, data.sub_sector)
     )
     await db.commit()

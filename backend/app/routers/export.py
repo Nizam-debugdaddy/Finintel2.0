@@ -1,15 +1,15 @@
-import traceback, aiosqlite
+import traceback
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from typing import Optional
 from app.services.service_factory import get_fresh_service
-from app.db.sqlite_db import DB
+from app.db.sqlite_db import DB, connect as db_connect
 
 router = APIRouter()
 
 async def _log_export(company_id: str, fmt: str, status: str, path: str = "", err: str = ""):
     try:
-        async with aiosqlite.connect(DB) as db:
+        async with db_connect(DB) as db:
             await db.execute(
                 "INSERT INTO export_log(company_id,format,status,file_path,error_msg) VALUES(?,?,?,?,?)",
                 (company_id, fmt, status, path, err[:500])
@@ -95,8 +95,7 @@ async def export_pdf(
 
 @router.get("/logs/{company_id}")
 async def export_logs(company_id: str):
-    async with aiosqlite.connect(DB) as db:
-        db.row_factory = aiosqlite.Row
+    async with db_connect(DB) as db:
         async with db.execute(
             "SELECT * FROM export_log WHERE company_id=? ORDER BY created_at DESC LIMIT 20",
             (company_id,)

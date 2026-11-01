@@ -5,13 +5,15 @@ with versioning, partitioning, and master-table maintenance.
 """
 
 from __future__ import annotations
-import shutil
+import os
 import time as _time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -21,6 +23,8 @@ from storage.schema import (
 )
 
 logger = get_logger("warehouse")
+
+FINANCIALS_COLUMNS = [f.name for f in FINANCIALS_SCHEMA]
 
 
 class Warehouse:
@@ -36,6 +40,22 @@ class Warehouse:
     def __init__(self, paths: Paths):
         self.paths = paths
         self.paths.ensure()
+        self._dsn = os.environ.get("DATABASE_URL", "")
+
+    @contextmanager
+    def _conn(self):
+        """`with self._conn() as conn:` commits (or rolls back) AND closes —
+        a bare psycopg2 connection used as a context manager commits but never
+        closes, which would leak connections against the pooler over time."""
+        conn = psycopg2.connect(self._dsn)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     # ── Company master ──────────────────────────────────────────────
 
@@ -67,61 +87,19 @@ class Warehouse:
     # ── Financials (versioned fact table) ───────────────────────────
 
     def load_all_financials(self) -> pd.DataFrame:
-        """Read the full financials dataset. Returns empty frame if none exist.
-        Falls back to reading company-by-company if the full dataset read fails
-        (handles cases where a bad/corrupt file is present in one partition).
-        """
-        if not self.paths.wh_financials.exists() or \
-           not any(self.paths.wh_financials.rglob("*.parquet")):
-            return pd.DataFrame(columns=[f.name for f in FINANCIALS_SCHEMA])
-        # ── Primary: read all at once (fast) ──────────────────────────────────
-        try:
-            ds = pq.ParquetDataset(
-                str(self.paths.wh_financials),
-                use_legacy_dataset=False,
-            )
-            return ds.read().to_pandas()
-        except Exception as e1:
-            logger.warning(f"load_all_financials primary read failed: {e1}. "
-                           f"Attempting per-company fallback read…")
-
-        # ── Fallback: read each *.parquet individually, skip corrupted ones ──
-        frames = []
-        for pf in sorted(self.paths.wh_financials.rglob("*.parquet")):
-            try:
-                frames.append(pq.read_table(str(pf)).to_pandas())
-            except Exception as e2:
-                logger.warning(f"Skipping bad parquet {pf}: {e2}")
-                # Quarantine it so it doesn't block again
-                try:
-                    pf.rename(pf.with_suffix(".bad"))
-                    logger.warning(f"Quarantined: {pf}")
-                except Exception:
-                    pass
-
-        if frames:
-            return pd.concat(frames, ignore_index=True)
-        return pd.DataFrame(columns=[f.name for f in FINANCIALS_SCHEMA])
+        """Read the full financials dataset from Postgres. Empty frame if none exist."""
+        with self._conn() as conn:
+            df = pd.read_sql(f"SELECT {','.join(FINANCIALS_COLUMNS)} FROM financials", conn)
+        return df if not df.empty else pd.DataFrame(columns=FINANCIALS_COLUMNS)
 
     def load_company_financials(self, company_id: str) -> pd.DataFrame:
-        """Read financials for a single company using hive partition pruning.
-        Reads only company_id=X/ — much faster than loading all companies.
-        """
-        if not self.paths.wh_financials.exists() or \
-           not any(self.paths.wh_financials.rglob("*.parquet")):
-            return pd.DataFrame(columns=[f.name for f in FINANCIALS_SCHEMA])
-        try:
-            ds = pq.ParquetDataset(
-                str(self.paths.wh_financials),
-                use_legacy_dataset=False,
-                filters=[("company_id", "=", company_id)],
+        """Read financials for a single company from Postgres (indexed on company_id)."""
+        with self._conn() as conn:
+            df = pd.read_sql(
+                f"SELECT {','.join(FINANCIALS_COLUMNS)} FROM financials WHERE company_id = %(cid)s",
+                conn, params={"cid": company_id},
             )
-            df = ds.read().to_pandas()
-            return df
-        except Exception as e:
-            logger.warning(f"load_company_financials({company_id}) failed: {e}. Falling back to full read.")
-            full = self.load_all_financials()
-            return full[full["company_id"] == company_id].copy() if not full.empty else full
+        return df if not df.empty else pd.DataFrame(columns=FINANCIALS_COLUMNS)
 
     def ingest_financials(self, new_records: list[dict], ingestion_id: str | None = None) -> dict:
         """
@@ -217,27 +195,17 @@ class Warehouse:
                 .astype("datetime64[us]")
             )
 
-        # Delete only this company's partition — leaves other companies untouched.
-        # This is the key optimization: previously rmtree deleted ALL companies' data
-        # and rewrote the entire warehouse on every ingest call.
+        # Delete only this company's rows — leaves other companies untouched.
+        # Mirrors the old per-company parquet-partition rewrite, now as plain SQL.
         _tw1 = _time.perf_counter()
-        self.paths.wh_financials.mkdir(parents=True, exist_ok=True)
-        if company_id_scope:
-            company_dir = self.paths.wh_financials / f"company_id={company_id_scope}"
-            if company_dir.exists():
-                shutil.rmtree(company_dir)
-        else:
-            if self.paths.wh_financials.exists():
-                shutil.rmtree(self.paths.wh_financials)
-            self.paths.wh_financials.mkdir(parents=True, exist_ok=True)
-
-        tbl = pa.Table.from_pandas(combined, schema=FINANCIALS_SCHEMA, preserve_index=False)
-        pq.write_to_dataset(
-            tbl,
-            root_path=str(self.paths.wh_financials),
-            partition_cols=["company_id", "year"],
-        )
-        logger.warning(f"[WH] write {len(combined)} rows to parquet in {_time.perf_counter()-_tw1:.3f}s")
+        with self._conn() as conn, conn.cursor() as cur:
+            if company_id_scope:
+                cur.execute("DELETE FROM financials WHERE company_id = %s", (company_id_scope,))
+            else:
+                cur.execute("DELETE FROM financials")
+            self._insert_financials(cur, combined)
+            conn.commit()
+        logger.warning(f"[WH] write {len(combined)} rows to Postgres in {_time.perf_counter()-_tw1:.3f}s")
 
         self._append_audit(
             ingestion_id=ingestion_id,
@@ -258,18 +226,35 @@ class Warehouse:
         logger.info(f"Ingested batch: {summary}")
         return summary
 
+    # ── Bulk insert helper ────────────────────────────────────────────
+
+    def _insert_financials(self, cur, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        df = df[FINANCIALS_COLUMNS].copy()
+        df["version"] = df["version"].fillna(1).astype(int)
+        df["is_active"] = df["is_active"].astype(bool)
+        df["updated_on"] = pd.to_datetime(df["updated_on"], errors="coerce", utc=True).dt.tz_convert(None)
+        rows = [tuple(None if pd.isna(v) else v for v in r) for r in df.itertuples(index=False, name=None)]
+        psycopg2.extras.execute_values(
+            cur,
+            f"INSERT INTO financials ({','.join(FINANCIALS_COLUMNS)}) VALUES %s",
+            rows,
+        )
+
     # ── Audit ───────────────────────────────────────────────────────
 
     def _append_audit(self, **kw) -> None:
         kw.setdefault("timestamp", datetime.utcnow())
-        row_df = pd.DataFrame([kw])
-        if self.paths.wh_audit.exists():
-            old = pq.read_table(self.paths.wh_audit).to_pandas()
-            combined = pd.concat([old, row_df], ignore_index=True)
-        else:
-            combined = row_df
-        tbl = pa.Table.from_pandas(combined, schema=AUDIT_SCHEMA, preserve_index=False)
-        pq.write_table(tbl, self.paths.wh_audit)
+        cols = ["ingestion_id", "company_id", "source_file", "rows_loaded",
+                "rows_revised", "status", "notes", "timestamp"]
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO wh_audit_log ({','.join(cols)}) VALUES "
+                f"({','.join(['%s']*len(cols))})",
+                tuple(kw.get(c) for c in cols),
+            )
+            conn.commit()
 
     def read_audit_log(self) -> pd.DataFrame:
         if not self.paths.wh_audit.exists():
@@ -277,48 +262,24 @@ class Warehouse:
         return pq.read_table(self.paths.wh_audit).to_pandas()
 
     def deactivate_period(self, company_id: str, period: str) -> int:
-        """
-        Mark ALL rows for (company_id, year=period) as is_active=False.
-        Used when analyst deletes all data for a period.
-        Returns the number of rows deactivated.
-        """
-        existing = self.load_company_financials(company_id)
-        if existing.empty:
-            return 0
-
-        mask = existing["year"] == period
-        n_deactivated = int(mask.sum())
-        if n_deactivated == 0:
-            return 0
-
-        # Drop the rows for this period entirely (clean removal, no inactive accumulation)
-        existing_keep = existing[~mask].copy()
-
-        self.paths.wh_financials.mkdir(parents=True, exist_ok=True)
-        company_dir = self.paths.wh_financials / f"company_id={company_id}"
-        if company_dir.exists():
-            shutil.rmtree(company_dir)
-
-        if not existing_keep.empty:
-            tbl = pa.Table.from_pandas(
-                existing_keep, schema=FINANCIALS_SCHEMA, preserve_index=False
+        """Delete all rows for (company_id, year=period). Used when an analyst
+        deletes and saves — ensures the dashboard shows no data for that period
+        instead of stale values. Returns the number of rows removed."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM financials WHERE company_id = %s AND year = %s",
+                (company_id, period),
             )
-            pq.write_to_dataset(
-                tbl,
-                root_path=str(self.paths.wh_financials),
-                partition_cols=["company_id", "year"],
-            )
-        logger.info(f"Removed {n_deactivated} rows for {company_id}/{period}")
-        return n_deactivated
+            n = cur.rowcount
+            conn.commit()
+        logger.info(f"Removed {n} rows for {company_id}/{period}")
+        return n
 
     def deactivate_all(self, company_id: str) -> int:
-        """Drop ALL warehouse rows for company_id by deleting its partition directory."""
-        existing = self.load_company_financials(company_id)
-        if existing.empty:
-            return 0
-        n = len(existing)
-        company_dir = self.paths.wh_financials / f"company_id={company_id}"
-        if company_dir.exists():
-            shutil.rmtree(company_dir)
+        """Delete ALL rows for company_id."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM financials WHERE company_id = %s", (company_id,))
+            n = cur.rowcount
+            conn.commit()
         logger.info(f"Removed all {n} rows for {company_id}")
         return n
