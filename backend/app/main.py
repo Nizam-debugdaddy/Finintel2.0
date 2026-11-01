@@ -7,6 +7,7 @@ Single port (8000) — no separate Node dev server needed.
 Dev mode: Run with FININTEL_DEV=1 to skip static file serving and use
 the Vite dev server on port 3000 alongside.
 """
+import asyncio
 import os
 from pathlib import Path
 from fastapi import FastAPI, Request
@@ -18,6 +19,7 @@ from contextlib import asynccontextmanager
 from app.cache_middleware import CacheMiddleware
 from app.config import settings
 from app.db.sqlite_db import init_db
+from app.services.service_factory import get_service
 from app.routers import (
     company, financial_input, calculate,
     dashboard, export, query, version, notes, peer
@@ -35,6 +37,10 @@ DEV_MODE = os.environ.get("FININTEL_DEV", "").strip() == "1"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # Warm up the AnalyticsService/QueryEngine singleton here (blocking Postgres
+    # ATTACH/CREATE VIEW calls) so the first real request doesn't pay that cost
+    # synchronously inside an async route handler, freezing the event loop.
+    await asyncio.to_thread(get_service)
     yield
 
 

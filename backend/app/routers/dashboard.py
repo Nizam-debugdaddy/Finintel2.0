@@ -255,7 +255,10 @@ async def sector_ranking(sector: str, period: str = "FY25"):
     try:
         svc  = get_service()
         sector_clause = "" if sector.upper() == "ALL" else f"AND s.sector = '{sector}'"
-        df = svc.engine.sql(f"""
+        loop = asyncio.get_event_loop()
+        # Blocking DuckDB/Postgres call (7-9s over the Supabase pooler) — run off
+        # the event loop so /health etc. stay responsive while this runs.
+        df = await loop.run_in_executor(_executor, svc.engine.sql, f"""
             SELECT c.company_id, c.company_name,
                 MAX(CASE WHEN f.financial_item='Revenue from Operations' THEN f.value END) as revenue,
                 MAX(CASE WHEN f.financial_item='EBITDA'                  THEN f.value END) as ebitda,
@@ -272,7 +275,6 @@ async def sector_ranking(sector: str, period: str = "FY25"):
         # Previously sequential: 4 companies × ~200ms each = ~800ms total
         # Now parallel: max(200ms each) ≈ 200ms total regardless of company count
         records = _clean_records(df.to_dict("records"))
-        loop = asyncio.get_event_loop()
 
         def _enrich(r: dict) -> dict:
             try:

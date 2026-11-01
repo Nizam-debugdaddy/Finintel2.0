@@ -7,7 +7,7 @@ POST /export/peer/png       → PNG image of both charts
 POST /export/peer/ppt       → PowerPoint with 4 slides
 """
 from __future__ import annotations
-import math, io
+import asyncio, math, io
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -180,6 +180,44 @@ class PeerExportRequest(BaseModel):
     format:        str = "png"   # png | ppt
 
 
+_FY_ORDER = [f"FY{y}" for y in range(19, 31)]
+
+
+def _compute_cost_structure_entry(svc, co: str, req: "CostStructureRequest") -> Optional[dict]:
+    """Per-company body of peer_cost_structure's loop — run via asyncio.to_thread
+    so N companies' blocking DuckDB/Postgres calls don't freeze the event loop."""
+    co_mode = req.company_modes.get(co, req.report_type)
+
+    if co_mode.startswith('5yr_'):
+        rtype = 'consolidated' if co_mode == '5yr_consolidated' else 'standalone'
+        try:
+            idx = _FY_ORDER.index(req.period)
+        except ValueError:
+            idx = len(_FY_ORDER) - 1
+        years_to_avg = _FY_ORDER[max(0, idx-4): idx+1]
+        yearly = []
+        for yr in years_to_avg:
+            cs = _get_cost_structure(svc, co, yr, rtype)
+            if cs and not cs.get('_error'):
+                yearly.append(cs)
+        if not yearly:
+            return None
+        avg_cs: dict = {}
+        seg_keys = [s for s, _ in COST_SEGMENTS]
+        for key in seg_keys + ['_revenue', '_total_cost']:
+            vals = [y.get(key) for y in yearly if y.get(key) is not None]
+            avg_cs[key] = sum(vals) / len(vals) if vals else None
+        avg_cs['_company'] = co
+        avg_cs['_period']  = f"5Y Avg ({req.period}→{years_to_avg[0]})"
+        return {k: _clean(v) for k, v in avg_cs.items()}
+    else:
+        rtype = co_mode if co_mode in ('consolidated', 'standalone') else req.report_type
+        cs = _get_cost_structure(svc, co, req.period, rtype)
+        if cs and not cs.get('_error'):
+            return {k: _clean(v) for k, v in cs.items()}
+        return None
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @router.post("/cost-structure")
 async def peer_cost_structure(req: CostStructureRequest):
@@ -194,41 +232,11 @@ async def peer_cost_structure(req: CostStructureRequest):
     }
     """
     svc = get_service()
-    result = {}
-    FY_ORDER = [f"FY{y}" for y in range(19, 31)]
 
-    for co in req.companies:
-        co_mode = req.company_modes.get(co, req.report_type)
-
-        if co_mode.startswith('5yr_'):
-            # 5-year average: average the last 5 available years
-            rtype = 'consolidated' if co_mode == '5yr_consolidated' else 'standalone'
-            try:
-                idx = FY_ORDER.index(req.period)
-            except ValueError:
-                idx = len(FY_ORDER) - 1
-            years_to_avg = FY_ORDER[max(0, idx-4): idx+1]
-            yearly = []
-            for yr in years_to_avg:
-                cs = _get_cost_structure(svc, co, yr, rtype)
-                if cs and not cs.get('_error'):
-                    yearly.append(cs)
-            if not yearly:
-                continue
-            # Average each segment across available years
-            avg_cs: dict = {}
-            seg_keys = [s for s, _ in COST_SEGMENTS]
-            for key in seg_keys + ['_revenue', '_total_cost']:
-                vals = [y.get(key) for y in yearly if y.get(key) is not None]
-                avg_cs[key] = sum(vals) / len(vals) if vals else None
-            avg_cs['_company'] = co
-            avg_cs['_period']  = f"5Y Avg ({req.period}→{years_to_avg[0]})"
-            result[co] = {k: _clean(v) for k, v in avg_cs.items()}
-        else:
-            rtype = co_mode if co_mode in ('consolidated', 'standalone') else req.report_type
-            cs = _get_cost_structure(svc, co, req.period, rtype)
-            if cs and not cs.get('_error'):
-                result[co] = {k: _clean(v) for k, v in cs.items()}
+    entries = await asyncio.gather(
+        *(asyncio.to_thread(_compute_cost_structure_entry, svc, co, req) for co in req.companies)
+    )
+    result = {co: entry for co, entry in zip(req.companies, entries) if entry is not None}
 
     seg_names = [s[0] for s in COST_SEGMENTS]
     return {
@@ -239,6 +247,36 @@ async def peer_cost_structure(req: CostStructureRequest):
         "unit":      req.unit,
         "data":      result,
     }
+
+
+def _compute_multi_metric_entry(svc, co: str, req) -> Optional[list]:
+    """Per-company body of peer_multi_metric's loop — run via asyncio.to_thread.
+    Returns a list of (metric, value) pairs, or None if the company has no data.
+    Shared by peer_multi_metric and export_peer_ppt (same metric-table shape)."""
+    dash = svc.get_dashboard_data(co, period=req.period, report_type=req.report_type)
+    if not dash or dash.get("no_data"):
+        return None
+    kpis = dash.get("kpis", {})
+
+    out = []
+    for metric in req.metrics:
+        val = None
+        if metric in METRIC_MAP:
+            kpi_key, sub_key = METRIC_MAP[metric]
+            if kpi_key == "__warehouse__":
+                try:
+                    wh_df = svc.engine.get_company_history(co)
+                    wh_row = wh_df[
+                        (wh_df["financial_item"] == sub_key) &
+                        (wh_df["year"] == req.period)
+                    ]
+                    val = _clean(float(wh_row["value"].iloc[0])) if not wh_row.empty else None
+                except Exception:
+                    val = None
+            else:
+                val = _clean((kpis.get(kpi_key) or {}).get(sub_key))
+        out.append((metric, val))
+    return out
 
 
 @router.post("/multi-metric")
@@ -257,29 +295,13 @@ async def peer_multi_metric(req: MultiMetricRequest):
     rows = []
     table: dict = {m: {} for m in req.metrics}
 
-    for co in req.companies:
-        dash = svc.get_dashboard_data(co, period=req.period, report_type=req.report_type)
-        if not dash or dash.get("no_data"):
+    entries = await asyncio.gather(
+        *(asyncio.to_thread(_compute_multi_metric_entry, svc, co, req) for co in req.companies)
+    )
+    for co, entry in zip(req.companies, entries):
+        if entry is None:
             continue
-        kpis = dash.get("kpis", {})
-
-        for metric in req.metrics:
-            val = None
-            if metric in METRIC_MAP:
-                kpi_key, sub_key = METRIC_MAP[metric]
-                if kpi_key == "__warehouse__":
-                    # Fetch directly from warehouse — not a dashboard KPI
-                    try:
-                        wh_df = svc.engine.get_company_history(co)
-                        wh_row = wh_df[
-                            (wh_df["financial_item"] == sub_key) &
-                            (wh_df["year"] == req.period)
-                        ]
-                        val = _clean(float(wh_row["value"].iloc[0])) if not wh_row.empty else None
-                    except Exception:
-                        val = None
-                else:
-                    val = _clean((kpis.get(kpi_key) or {}).get(sub_key))
+        for metric, val in entry:
             rows.append({"company_id": co, "metric": metric, "value": val})
             table[metric][co] = val
 
@@ -301,11 +323,13 @@ async def export_peer_png(req: PeerExportRequest):
     from app.services.chart_builder import make_cost_structure_chart
 
     svc = get_service()
-    cost_data: dict = {}
-    for co in req.companies:
-        cs = _get_cost_structure(svc, co, req.period, req.report_type)
-        if cs and not cs.get("_error"):
-            cost_data[co] = {k: _clean(v) for k, v in cs.items()}
+    cs_results = await asyncio.gather(
+        *(asyncio.to_thread(_get_cost_structure, svc, co, req.period, req.report_type) for co in req.companies)
+    )
+    cost_data: dict = {
+        co: {k: _clean(v) for k, v in cs.items()}
+        for co, cs in zip(req.companies, cs_results) if cs and not cs.get("_error")
+    }
 
     png = make_cost_structure_chart(
         cost_data, req.companies, req.period,
@@ -330,31 +354,24 @@ async def export_peer_ppt(req: PeerExportRequest):
     svc = get_service()
 
     # ── Gather cost structure data ─────────────────────────────────
-    cost_data: dict = {}
-    for co in req.companies:
-        cs = _get_cost_structure(svc, co, req.period, req.report_type)
-        if cs and not cs.get("_error"):
-            cost_data[co] = {k: _clean(v) for k, v in cs.items()}
+    cs_results = await asyncio.gather(
+        *(asyncio.to_thread(_get_cost_structure, svc, co, req.period, req.report_type) for co in req.companies)
+    )
+    cost_data: dict = {
+        co: {k: _clean(v) for k, v in cs.items()}
+        for co, cs in zip(req.companies, cs_results) if cs and not cs.get("_error")
+    }
 
     # ── Gather metric table ────────────────────────────────────────
     metric_table: dict = {m: {} for m in req.metrics}
-    for co in req.companies:
-        dash = svc.get_dashboard_data(co, period=req.period, report_type=req.report_type)
-        if not dash or dash.get("no_data"):
+    mm_results = await asyncio.gather(
+        *(asyncio.to_thread(_compute_multi_metric_entry, svc, co, req) for co in req.companies)
+    )
+    for co, entry in zip(req.companies, mm_results):
+        if entry is None:
             continue
-        kpis = dash.get("kpis", {})
-        for metric in req.metrics:
-            if metric in METRIC_MAP:
-                kpi_key, sub_key = METRIC_MAP[metric]
-                if kpi_key == "__warehouse__":
-                    try:
-                        wh_df = svc.engine.get_company_history(co)
-                        row = wh_df[(wh_df["financial_item"] == sub_key) & (wh_df["year"] == req.period)]
-                        metric_table[metric][co] = _clean(float(row["value"].iloc[0])) if not row.empty else None
-                    except Exception:
-                        metric_table[metric][co] = None
-                else:
-                    metric_table[metric][co] = _clean((kpis.get(kpi_key) or {}).get(sub_key))
+        for metric, val in entry:
+            metric_table[metric][co] = val
 
     # ── Generate chart images ──────────────────────────────────────
     cost_png_abs = make_cost_structure_chart(
@@ -433,36 +450,15 @@ _RATIO_METRICS = {
 }
 
 
-@router.post("/trend")
-async def peer_trend(req: TrendRequest):
-    """
-    Returns a single metric's value for each company across a year range.
-    Uses direct warehouse reads (one query per company) for speed —
-    avoids the overhead of calling get_dashboard_data per year.
-    """
-    svc = get_service()
-
-    FY_ORDER = [f"FY{y}" for y in range(19, 31)]
+def _compute_trend_one(svc, co: str, years: list, direct, is_margin: bool,
+                        margin_num: str, metric: str, report_type: str) -> list:
+    """Per-company body of peer_trend's loop — run via asyncio.to_thread."""
+    values: list = []
     try:
-        s_idx = FY_ORDER.index(req.start_year)
-        e_idx = FY_ORDER.index(req.end_year)
-        years = FY_ORDER[min(s_idx, e_idx): max(s_idx, e_idx) + 1]
-    except ValueError:
-        years = [req.start_year, req.end_year]
-
-    # Determine how to fetch this metric
-    direct = _TREND_DIRECT.get(req.metric)
-    is_margin = req.metric in ("EBITDA Margin", "EBITDA Margin %", "PAT Margin", "PAT Margin %")
-    margin_num = "EBITDA" if req.metric in ("EBITDA Margin", "EBITDA Margin %") else "PAT"
-
-    series = []
-    for co in req.companies:
-        values: list = []
-        try:
-            wh = svc.engine.get_company_history(co)
-            if wh.empty:
-                series.append({"company_id": co, "values": [None]*len(years)})
-                continue
+        wh = svc.engine.get_company_history(co)
+        if wh.empty:
+            return [None] * len(years)
+        if True:  # shortcut: keeps nested helpers' indentation unchanged from the original loop body
 
             def _pick(item, yr, prefer_cat=None):
                 """Fetch one value from warehouse; prefer_cat for P&L items."""
@@ -569,16 +565,15 @@ async def peer_trend(req: TrendRequest):
                         return _clean(round(ddays + idays - cdays, 1))
                 return None
 
-            if req.metric in _RATIO_METRICS:
+            if metric in _RATIO_METRICS:
                 for yr in years:
-                    try:   values.append(_pick_ratio(req.metric, yr))
+                    try:   values.append(_pick_ratio(metric, yr))
                     except Exception: values.append(None)
             elif direct and direct[0] == "__altman_z__":
                 for yr in years:
                     try:   values.append(_pick_altman(yr))
                     except Exception: values.append(None)
             elif is_margin:
-                rev_sub = wh[(wh["financial_item"] == "Revenue from Operations")]
                 for yr in years:
                     try:
                         num = _pick(margin_num, yr)
@@ -593,20 +588,49 @@ async def peer_trend(req: TrendRequest):
                     except Exception: values.append(None)
             else:
                 # Fallback: use get_dashboard_data kpi lookup for unmapped metrics
-                kpi_key, sub_key = METRIC_MAP.get(req.metric, (None, None))
+                kpi_key, sub_key = METRIC_MAP.get(metric, (None, None))
                 for yr in years:
                     try:
-                        dash = svc.get_dashboard_data(co, period=yr, report_type=req.report_type)
+                        dash = svc.get_dashboard_data(co, period=yr, report_type=report_type)
                         val  = _clean((dash.get("kpis", {}).get(kpi_key) or {}).get(sub_key)) \
                                if kpi_key and dash and not dash.get("no_data") else None
                         values.append(val)
                     except Exception:
                         values.append(None)
 
-        except Exception:
-            values = [None] * len(years)
+    except Exception:
+        values = [None] * len(years)
 
-        series.append({"company_id": co, "values": values})
+    return values
+
+
+@router.post("/trend")
+async def peer_trend(req: TrendRequest):
+    """
+    Returns a single metric's value for each company across a year range.
+    Uses direct warehouse reads (one query per company) for speed —
+    avoids the overhead of calling get_dashboard_data per year.
+    """
+    svc = get_service()
+
+    FY_ORDER = [f"FY{y}" for y in range(19, 31)]
+    try:
+        s_idx = FY_ORDER.index(req.start_year)
+        e_idx = FY_ORDER.index(req.end_year)
+        years = FY_ORDER[min(s_idx, e_idx): max(s_idx, e_idx) + 1]
+    except ValueError:
+        years = [req.start_year, req.end_year]
+
+    direct = _TREND_DIRECT.get(req.metric)
+    is_margin = req.metric in ("EBITDA Margin", "EBITDA Margin %", "PAT Margin", "PAT Margin %")
+    margin_num = "EBITDA" if req.metric in ("EBITDA Margin", "EBITDA Margin %") else "PAT"
+
+    results = await asyncio.gather(
+        *(asyncio.to_thread(_compute_trend_one, svc, co, years, direct, is_margin,
+                             margin_num, req.metric, req.report_type)
+          for co in req.companies)
+    )
+    series = [{"company_id": co, "values": vals} for co, vals in zip(req.companies, results)]
 
     return {
         "companies":    req.companies,
@@ -625,46 +649,70 @@ class DueDiligenceRequest(BaseModel):
     report_type: str  = "consolidated"
 
 
-@router.post("/due-diligence")
-async def peer_due_diligence(req: DueDiligenceRequest):
-    """
-    Compute a full 20-metric financial due diligence table for N supplier companies.
-    Returns per-company values, health status (green/yellow/red), score, and rating.
-    """
-    svc  = get_service()
-    rspr = WarehouseReshaper(svc.engine)
+def _dd_gv(df, item, default=None):
+    """Get value from a wide DataFrame by row label."""
+    try:
+        if df is None or df.empty: return default
+        if item in df.index:
+            v = df.loc[item]
+            v = v.iloc[0] if hasattr(v, 'iloc') else v
+            return float(v) if v is not None and not (isinstance(v, float) and math.isnan(v)) else default
+    except Exception:
+        pass
+    return default
 
-    def gv(df, item, default=None):
-        """Get value from a wide DataFrame by row label."""
-        try:
-            if df is None or df.empty: return default
-            if item in df.index:
-                v = df.loc[item]
-                v = v.iloc[0] if hasattr(v, 'iloc') else v
-                import math
-                return float(v) if v is not None and not (isinstance(v, float) and math.isnan(v)) else default
-        except Exception:
-            pass
-        return default
 
-    def sd(n, d, pct=False, decimals=2):
-        """Safe divide."""
-        try:
-            if n is None or d is None or d == 0: return None
-            r = float(n) / float(d)
-            return round(r * 100, decimals) if pct else round(r, decimals)
-        except Exception:
-            return None
+def _dd_sd(n, d, pct=False, decimals=2):
+    """Safe divide."""
+    try:
+        if n is None or d is None or d == 0: return None
+        r = float(n) / float(d)
+        return round(r * 100, decimals) if pct else round(r, decimals)
+    except Exception:
+        return None
 
-    results = {}
 
-    for co in req.companies:
-        try:
+def _dd_classify(key, val):
+    if val is None: return "na"
+    THRESHOLDS = {
+        "current_ratio":   ((1.5, float('inf')), (1.0, 1.5), (-float('inf'), 1.0)),
+        "quick_ratio":     ((1.0, float('inf')), (0.7, 1.0), (-float('inf'), 0.7)),
+        "cash_ratio":      ((0.5, float('inf')), (0.2, 0.5), (-float('inf'), 0.2)),
+        "gross_margin":    ((30,  float('inf')), (15,  30),  (-float('inf'), 15)),
+        "ebitda_margin":   ((20,  float('inf')), (10,  20),  (-float('inf'), 10)),
+        "ebit_margin":     ((15,  float('inf')), (5,   15),  (-float('inf'), 5)),
+        "net_margin":      ((10,  float('inf')), (3,   10),  (-float('inf'), 3)),
+        "roa":             ((5,   float('inf')), (2,   5),   (-float('inf'), 2)),
+        "roe":             ((15,  float('inf')), (8,   15),  (-float('inf'), 8)),
+        "ocf_margin":      ((15,  float('inf')), (5,   15),  (-float('inf'), 5)),
+        "cash_conv_ratio": ((1.0, float('inf')), (0.7, 1.0), (-float('inf'), 0.7)),
+        "de_ratio":        ((-float('inf'), 0.5), (0.5, 1.5), (1.5, float('inf'))),
+        "da_ratio":        ((-float('inf'), 0.3), (0.3, 0.6), (0.6, float('inf'))),
+        "interest_cov":    ((4,   float('inf')), (2,   4),   (-float('inf'), 2)),
+        "fin_leverage":    ((-float('inf'), 2.0), (2.0, 3.5), (3.5, float('inf'))),
+        "inventory_days":  ((-float('inf'), 60),  (60,  90),  (90, float('inf'))),
+        "receivable_days": ((-float('inf'), 45),  (45,  75),  (75, float('inf'))),
+        "payable_days":    ((30, float('inf')),  (15,  30),  (-float('inf'), 15)),
+        "ccc":             ((-float('inf'), 60),  (60, 120),  (120, float('inf'))),
+    }
+    thresh = THRESHOLDS.get(key)
+    if not thresh: return "green"
+    g_lo, g_hi = thresh[0]
+    y_lo, y_hi = thresh[1]
+    if g_lo <= val < g_hi: return "green"
+    if y_lo <= val < y_hi: return "yellow"
+    return "red"
+
+
+def _compute_due_diligence_one(rspr, co: str, period: str) -> dict:
+    """Per-company body of peer_due_diligence's loop — run via asyncio.to_thread."""
+    gv, sd, classify = _dd_gv, _dd_sd, _dd_classify
+    try:
             # ── Fetch wide DataFrames from warehouse ──────────────────────────
             pnl_df, years_pnl = rspr.get_pnl_wide(co, "P&L Consolidated")
             az_df,  years_az  = rspr.get_altman_wide(co)
 
-            yr = req.period
+            yr = period
 
             # Helper to get from either df
             def P(item):   return gv(pnl_df, item)
@@ -736,37 +784,6 @@ async def peer_due_diligence(req: DueDiligenceRequest):
                     metrics["inventory_days"] + metrics["receivable_days"] - metrics["payable_days"], 1)
 
             # ── Health classification ─────────────────────────────────────────
-            def classify(key, val):
-                if val is None: return "na"
-                THRESHOLDS = {
-                    "current_ratio":   ((1.5, float('inf')), (1.0, 1.5), (-float('inf'), 1.0)),
-                    "quick_ratio":     ((1.0, float('inf')), (0.7, 1.0), (-float('inf'), 0.7)),
-                    "cash_ratio":      ((0.5, float('inf')), (0.2, 0.5), (-float('inf'), 0.2)),
-                    "gross_margin":    ((30,  float('inf')), (15,  30),  (-float('inf'), 15)),
-                    "ebitda_margin":   ((20,  float('inf')), (10,  20),  (-float('inf'), 10)),
-                    "ebit_margin":     ((15,  float('inf')), (5,   15),  (-float('inf'), 5)),
-                    "net_margin":      ((10,  float('inf')), (3,   10),  (-float('inf'), 3)),
-                    "roa":             ((5,   float('inf')), (2,   5),   (-float('inf'), 2)),
-                    "roe":             ((15,  float('inf')), (8,   15),  (-float('inf'), 8)),
-                    "ocf_margin":      ((15,  float('inf')), (5,   15),  (-float('inf'), 5)),
-                    "cash_conv_ratio": ((1.0, float('inf')), (0.7, 1.0), (-float('inf'), 0.7)),
-                    "de_ratio":        ((-float('inf'), 0.5), (0.5, 1.5), (1.5, float('inf'))),
-                    "da_ratio":        ((-float('inf'), 0.3), (0.3, 0.6), (0.6, float('inf'))),
-                    "interest_cov":    ((4,   float('inf')), (2,   4),   (-float('inf'), 2)),
-                    "fin_leverage":    ((-float('inf'), 2.0), (2.0, 3.5), (3.5, float('inf'))),
-                    "inventory_days":  ((-float('inf'), 60),  (60,  90),  (90, float('inf'))),
-                    "receivable_days": ((-float('inf'), 45),  (45,  75),  (75, float('inf'))),
-                    "payable_days":    ((30, float('inf')),  (15,  30),  (-float('inf'), 15)),
-                    "ccc":             ((-float('inf'), 60),  (60, 120),  (120, float('inf'))),
-                }
-                thresh = THRESHOLDS.get(key)
-                if not thresh: return "green"
-                g_lo, g_hi = thresh[0]
-                y_lo, y_hi = thresh[1]
-                if g_lo <= val < g_hi: return "green"
-                if y_lo <= val < y_hi: return "yellow"
-                return "red"
-
             health = {k: classify(k, v) for k, v in metrics.items()}
 
             # ── Risk Score (0–100) ────────────────────────────────────────────
@@ -783,7 +800,7 @@ async def peer_due_diligence(req: DueDiligenceRequest):
             elif risk_score >= 35: rating = "D"
             else:                  rating = "E"
 
-            results[co] = {
+            return {
                 "metrics": metrics,
                 "health":  health,
                 "risk_score": risk_score,
@@ -791,8 +808,23 @@ async def peer_due_diligence(req: DueDiligenceRequest):
                 "period":     yr,
             }
 
-        except Exception as e:
-            results[co] = {"error": str(e), "metrics": {}, "health": {},
-                           "risk_score": 0, "rating": "E", "period": req.period}
+    except Exception as e:
+        return {"error": str(e), "metrics": {}, "health": {},
+                "risk_score": 0, "rating": "E", "period": period}
+
+
+@router.post("/due-diligence")
+async def peer_due_diligence(req: DueDiligenceRequest):
+    """
+    Compute a full 20-metric financial due diligence table for N supplier companies.
+    Returns per-company values, health status (green/yellow/red), score, and rating.
+    """
+    svc  = get_service()
+    rspr = WarehouseReshaper(svc.engine)
+
+    entries = await asyncio.gather(
+        *(asyncio.to_thread(_compute_due_diligence_one, rspr, co, req.period) for co in req.companies)
+    )
+    results = dict(zip(req.companies, entries))
 
     return {"companies": req.companies, "period": req.period, "results": results}
